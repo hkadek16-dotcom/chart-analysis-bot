@@ -21,78 +21,84 @@ SAVE_DIR.mkdir(exist_ok=True)
 LOG_FILE = SAVE_DIR / "analysis_results.csv"
 
 
-def detect_candles(path):
+def read_chart(path):
     with Image.open(path) as img:
         img = img.convert("RGB")
-        img.thumbnail((1000, 700))
+        img.thumbnail((900, 650))
         width, height = img.size
-        pixels = img.load()
+        px = img.load()
 
-        # نبحث عن بكسلات الشموع الخضراء والحمراء
-        columns = []
+        # اكتشاف الألوان القوية فقط لتخفيف ضجيج الخلفية
+        mask = {}
         for x in range(width):
-            ys = []
-            colors = Counter()
-
             for y in range(height):
-                r, g, b = pixels[x, y]
+                r, g, b = px[x, y]
+                if g > 95 and g > r * 1.20 and g > b * 1.10:
+                    mask[(x, y)] = "UP"
+                elif r > 100 and r > g * 1.20 and r > b * 1.10:
+                    mask[(x, y)] = "DOWN"
 
-                if g > 85 and g > r * 1.25 and g > b * 1.15:
-                    ys.append(y)
-                    colors["UP"] += 1
-                elif r > 100 and r > g * 1.25 and r > b * 1.15:
-                    ys.append(y)
-                    colors["DOWN"] += 1
+        # تجميع البكسلات المتجاورة أفقياً إلى أجسام محتملة للشموع
+        by_x = {}
+        for (x, y), color in mask.items():
+            by_x.setdefault(x, []).append((y, color))
 
-            if len(ys) >= 2:
-                columns.append({
-                    "x": x,
-                    "top": min(ys),
-                    "bottom": max(ys),
-                    "color": colors.most_common(1)[0][0],
-                    "count": len(ys),
-                })
+        active_columns = []
+        for x in sorted(by_x):
+            items = by_x[x]
+            ys = [item[0] for item in items]
+            colors = Counter(item[1] for item in items)
 
-    # تجميع الأعمدة المتجاورة لتقدير مواقع الشموع
+            if len(ys) < 3:
+                continue
+
+            active_columns.append({
+                "x": x,
+                "top": min(ys),
+                "bottom": max(ys),
+                "color": colors.most_common(1)[0][0],
+                "pixels": len(ys),
+            })
+
     groups = []
-    for col in columns:
-        if groups and col["x"] - groups[-1][-1]["x"] <= 3:
+    for col in active_columns:
+        if groups and col["x"] - groups[-1][-1]["x"] <= 2:
             groups[-1].append(col)
         else:
             groups.append([col])
 
     candles = []
     for group in groups:
-        if len(group) > 24:
+        if len(group) > 18:
             continue
 
         top = min(c["top"] for c in group)
         bottom = max(c["bottom"] for c in group)
-        if bottom - top < 3:
+        if bottom - top < 4:
             continue
 
-        counts = Counter()
+        colors = Counter()
         for c in group:
-            counts[c["color"]] += c["count"]
+            colors[c["color"]] += c["pixels"]
 
         candles.append({
             "x": sum(c["x"] for c in group) / len(group),
             "high": top,
             "low": bottom,
-            "color": counts.most_common(1)[0][0],
+            "color": colors.most_common(1)[0][0],
         })
 
     return candles, width, height
 
 
-def analyse(path):
-    candles, width, height = detect_candles(path)
+def analyse_chart(path):
+    candles, width, height = read_chart(path)
 
-    if len(candles) < 8:
+    if len(candles) < 6:
         return (
-            "⚠️ ما قدرت أميّز 8 شموع واضحة على الأقل.\n"
-            "جرّب صورة للشارت أوضح، واقصّ القوائم "
-            "والأزرار قدر الإمكان."
+            "⚠️ ما قدرت أميّز شموع كافية.\n"
+            "جرّب صورة يظهر فيها الشارت بشكل أكبر، "
+            "وتأكد أن الشموع خضرا وحمرا وواضحة."
         ), "WAIT"
 
     recent = candles[-12:]
@@ -100,62 +106,57 @@ def analyse(path):
     lows = [c["low"] for c in recent]
     colors = [c["color"] for c in recent]
 
-    rising_highs = highs[-1] < highs[0]
-    rising_lows = lows[-1] < lows[0]
-    falling_highs = highs[-1] > highs[0]
-    falling_lows = lows[-1] > lows[0]
+    up = colors.count("UP")
+    down = colors.count("DOWN")
 
-    up_count = colors.count("UP")
-    down_count = colors.count("DOWN")
+    # إحداثيات الصورة ليست أسعاراً فعلية
+    lower_highs = highs[-1] < highs[0]
+    lower_lows = lows[-1] < lows[0]
+    higher_highs = highs[-1] > highs[0]
+    higher_lows = lows[-1] > lows[0]
 
-    if rising_highs and rising_lows and up_count > down_count:
-        direction = "UP"
+    if higher_highs and higher_lows and up > down:
+        decision = "UP"
         trend = "ميل صاعد مبدئي"
-    elif falling_highs and falling_lows and down_count > up_count:
-        direction = "DOWN"
+    elif lower_highs and lower_lows and down > up:
+        decision = "DOWN"
         trend = "ميل هابط مبدئي"
     else:
-        direction = "WAIT"
-        trend = "الاتجاه غير واضح بما يكفي"
+        decision = "WAIT"
+        trend = "الاتجاه غير واضح"
 
-    # هاي إحداثيات بالصورة، مو أسعار فعلية
     support_y = max(lows[-6:])
     resistance_y = min(highs[-6:])
 
     report = (
-        "📊 تحليل الشارت المجاني\n"
+        "📊 تحليل مبدئي للشارت\n"
         "━━━━━━━━━━━━━━━\n"
-        f"🕯️ شموع مرصودة تقريبياً: {len(candles)}\n"
-        f"🟢 خضراء ضمن آخر 12 شمعة: {up_count}\n"
-        f"🔴 حمراء ضمن آخر 12 شمعة: {down_count}\n\n"
+        f"🕯️ الشموع المكتشفة تقريبياً: {len(candles)}\n"
+        f"🟢 أعمدة خضراء ضمن آخر 12: {up}\n"
+        f"🔴 أعمدة حمراء ضمن آخر 12: {down}\n\n"
         f"📈 الاتجاه: {trend}\n"
-        f"🎯 القرار المبدئي: {direction}\n\n"
-        "📍 مناطق تقريبية داخل الصورة:\n"
-        f"• دعم بصري (إحداثي Y): {support_y}\n"
-        f"• مقاومة بصرية (إحداثي Y): {resistance_y}\n\n"
-        "⏱️ الفريم والسعر الحقيقي غير مقروءين "
-        "بشكل موثوق من هالفحص.\n"
-        "🛑 إلغاء الفكرة: أعد التقييم إذا تغيّر "
-        "شكل القمم والقيعان أو ظهر اختراق واضح.\n\n"
-        "⚠️ هاد تقدير بصري تجريبي، مو قراءة "
-        "مضمونة للشموع ولا إشارة دخول مؤكدة.\n"
-        "لا تعتبر إحداثيات الصورة أسعاراً، "
-        "ولا تعتمد عليها وحدها لفتح صفقة."
+        f"🎯 القرار المبدئي: {decision}\n\n"
+        "📍 مناطق مرئية تقريبية بالصورة:\n"
+        f"• دعم بصري (Y): {support_y}\n"
+        f"• مقاومة بصرية (Y): {resistance_y}\n\n"
+        "⏱️ الفريم والسعر الحقيقي لازم يتأكدا من الشارت.\n"
+        "🛑 أعد التقييم إذا تغيّر ترتيب القمم والقيعان.\n\n"
+        "⚠️ إحداثيات Y هي مواقع داخل الصورة وليست أسعاراً.\n"
+        "هذا تقدير تجريبي وليس إشارة دخول مضمونة."
     )
+    return report, decision
 
-    return report, direction
 
-
-def save_result(path, direction, report):
-    new_file = not LOG_FILE.exists()
+def save_result(path, decision, report):
+    is_new = not LOG_FILE.exists()
     with LOG_FILE.open("a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        if new_file:
-            writer.writerow(["time", "image", "direction", "analysis"])
+        if is_new:
+            writer.writerow(["time", "image", "decision", "report"])
         writer.writerow([
             datetime.now().isoformat(timespec="seconds"),
             path.name,
-            direction,
+            decision,
             report.replace("\n", " | "),
         ])
 
@@ -163,11 +164,8 @@ def save_result(path, direction, report):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "أهلاً يا خيو! 👋\n"
-        "أنا بوت فحص الشارت المجاني.\n\n"
-        "📷 ابعت صورة واضحة للشموع.\n"
-        "/start — بدء\n"
-        "/results — تنزيل سجل التحليلات\n\n"
-        "الفحص تجريبي ولا يضمن توقع الحركة أو الربح."
+        "ابعت صورة واضحة للشارت حتى أجرّب تحليلها.\n"
+        "الفحص مجاني وتجريبي، وما بيضمن اتجاه السوق."
     )
 
 
@@ -178,29 +176,25 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         tg_file = await message.photo[-1].get_file()
         await tg_file.download_to_drive(custom_path=str(path))
-
-        report, direction = analyse(path)
-        save_result(path, direction, report)
-
+        report, decision = analyse_chart(path)
+        save_result(path, decision, report)
         await message.reply_text("✅ وصلت الصورة وانحفظت.\n\n" + report)
-
     except Exception as error:
-        print(f"Image error: {error}")
+        print(f"Photo error: {error}")
         await message.reply_text(
-            "صار خطأ بفحص الصورة. تأكد إن Pillow مثبتة، "
-            "وجرّب صورة ثانية."
+            "صار خطأ أثناء فحص الصورة. جرّب مرة ثانية."
         )
 
 
 async def results(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not LOG_FILE.exists():
-        await update.message.reply_text("لسا ما في تحليلات محفوظة.")
+        await update.message.reply_text("لسا ما في نتائج محفوظة.")
         return
 
     await update.message.reply_document(
         document=str(LOG_FILE),
         filename="analysis_results.csv",
-        caption="📁 سجل التحليلات المحفوظة"
+        caption="📁 سجل التحليلات"
     )
 
 
